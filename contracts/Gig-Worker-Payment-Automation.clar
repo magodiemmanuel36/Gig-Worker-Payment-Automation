@@ -8,8 +8,10 @@
 (define-constant ERR-DISPUTE-TIMEOUT (err u107))
 (define-constant ERR-ALREADY-RATED (err u108))
 (define-constant ERR-INVALID-RATING (err u109))
+(define-constant ERR-EMERGENCY-TIMEOUT (err u110))
 
 (define-constant DISPUTE-TIMEOUT-BLOCKS u1008)
+(define-constant EMERGENCY-WITHDRAWAL-BLOCKS u2016)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var gig-counter uint u0)
@@ -24,7 +26,8 @@
         milestone-count: uint,
         completed-milestones: uint,
         employer-rated: bool,
-        worker-rated: bool
+        worker-rated: bool,
+        created-at: uint
     }
 )
 
@@ -81,7 +84,8 @@
                 milestone-count: milestone-count,
                 completed-milestones: u0,
                 employer-rated: false,
-                worker-rated: false
+                worker-rated: false,
+                created-at: stacks-block-height
             }
         )
         (var-set gig-counter gig-id)
@@ -314,4 +318,25 @@
 
 (define-read-only (get-rating (gig-id uint) (rater principal))
     (ok (unwrap! (map-get? gig-ratings { gig-id: gig-id, rater: rater }) ERR-NOT-FOUND))
+)
+
+(define-public (emergency-withdraw (gig-id uint))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+            (remaining-amount (- (get amount gig) (* (get completed-milestones gig) (/ (get amount gig) (get milestone-count gig)))))
+        )
+        (asserts! (is-eq (get worker gig) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status gig) "active") ERR-INVALID-GIG)
+        (asserts! (>= stacks-block-height (+ (get created-at gig) EMERGENCY-WITHDRAWAL-BLOCKS)) ERR-EMERGENCY-TIMEOUT)
+        (asserts! (> remaining-amount u0) ERR-INSUFFICIENT-FUNDS)
+        
+        (try! (as-contract (stx-transfer? remaining-amount tx-sender (get worker gig))))
+        
+        (map-set gigs
+            { gig-id: gig-id }
+            (merge gig { status: "emergency-withdrawn" })
+        )
+        (ok remaining-amount)
+    )
 )
