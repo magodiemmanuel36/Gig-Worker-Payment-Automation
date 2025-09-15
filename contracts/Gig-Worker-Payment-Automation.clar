@@ -9,6 +9,10 @@
 (define-constant ERR-ALREADY-RATED (err u108))
 (define-constant ERR-INVALID-RATING (err u109))
 (define-constant ERR-EMERGENCY-TIMEOUT (err u110))
+(define-constant ERR-EXTENSION-NOT-FOUND (err u111))
+(define-constant ERR-EXTENSION-EXPIRED (err u112))
+(define-constant ERR-EXTENSION-ALREADY-APPROVED (err u113))
+(define-constant ERR-EXTENSION-ALREADY-EXISTS (err u114))
 
 (define-constant DISPUTE-TIMEOUT-BLOCKS u1008)
 (define-constant EMERGENCY-WITHDRAWAL-BLOCKS u2016)
@@ -36,7 +40,9 @@
     {
         amount: uint,
         completed: bool,
-        proof: (string-ascii 256)
+        proof: (string-ascii 256),
+        deadline: uint,
+        extended-deadline: (optional uint)
     }
 )
 
@@ -68,6 +74,18 @@
     }
 )
 
+(define-map extension-requests
+    { gig-id: uint, milestone-id: uint }
+    {
+        requested-by: principal,
+        additional-blocks: uint,
+        reason: (string-ascii 256),
+        status: (string-ascii 20),
+        created-at: uint,
+        approved-by: (optional principal)
+    }
+)
+
 (define-public (create-gig (worker principal) (total-amount uint) (milestone-count uint))
     (let
         (
@@ -93,12 +111,12 @@
     )
 )
 
-(define-public (submit-milestone (gig-id uint) (milestone-id uint) (proof (string-ascii 256)))
+(define-public (submit-milestone (gig-id uint) (milestone-id uint) (proof (string-ascii 256)) (deadline-blocks uint))
     (let
         (
             (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
             (milestone (default-to 
-                { amount: u0, completed: false, proof: "" }
+                { amount: u0, completed: false, proof: "", deadline: u0, extended-deadline: none }
                 (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id })
             ))
         )
@@ -109,7 +127,9 @@
             {
                 amount: (/ (get amount gig) (get milestone-count gig)),
                 completed: false,
-                proof: proof
+                proof: proof,
+                deadline: (+ stacks-block-height deadline-blocks),
+                extended-deadline: none
             }
         )
         (ok true)
@@ -318,6 +338,103 @@
 
 (define-read-only (get-rating (gig-id uint) (rater principal))
     (ok (unwrap! (map-get? gig-ratings { gig-id: gig-id, rater: rater }) ERR-NOT-FOUND))
+)
+
+(define-read-only (get-extension-request (gig-id uint) (milestone-id uint))
+    (ok (map-get? extension-requests { gig-id: gig-id, milestone-id: milestone-id }))
+)
+
+(define-public (request-extension (gig-id uint) (milestone-id uint) (additional-blocks uint) (reason (string-ascii 256)))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+            (milestone (unwrap! (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+            (existing-request (map-get? extension-requests { gig-id: gig-id, milestone-id: milestone-id }))
+            (is-employer (is-eq (get employer gig) tx-sender))
+            (is-worker (is-eq (get worker gig) tx-sender))
+        )
+        (asserts! (or is-employer is-worker) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status gig) "active") ERR-INVALID-GIG)
+        (asserts! (not (get completed milestone)) ERR-ALREADY-COMPLETED)
+        (asserts! (is-none existing-request) ERR-EXTENSION-ALREADY-EXISTS)
+        
+        (map-set extension-requests
+            { gig-id: gig-id, milestone-id: milestone-id }
+            {
+                requested-by: tx-sender,
+                additional-blocks: additional-blocks,
+                reason: reason,
+                status: "pending",
+                created-at: stacks-block-height,
+                approved-by: none
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-extension (gig-id uint) (milestone-id uint))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+            (milestone (unwrap! (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+            (extension-request (unwrap! (map-get? extension-requests { gig-id: gig-id, milestone-id: milestone-id }) ERR-EXTENSION-NOT-FOUND))
+            (is-employer (is-eq (get employer gig) tx-sender))
+            (is-worker (is-eq (get worker gig) tx-sender))
+            (requester (get requested-by extension-request))
+            (can-approve (or 
+                (and is-employer (is-eq requester (get worker gig)))
+                (and is-worker (is-eq requester (get employer gig)))
+            ))
+        )
+        (asserts! can-approve ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status extension-request) "pending") ERR-EXTENSION-ALREADY-APPROVED)
+        (asserts! (not (get completed milestone)) ERR-ALREADY-COMPLETED)
+        
+        (let
+            (
+                (new-deadline (+ (get deadline milestone) (get additional-blocks extension-request)))
+            )
+            (map-set milestones
+                { gig-id: gig-id, milestone-id: milestone-id }
+                (merge milestone { extended-deadline: (some new-deadline) })
+            )
+            
+            (map-set extension-requests
+                { gig-id: gig-id, milestone-id: milestone-id }
+                (merge extension-request { 
+                    status: "approved",
+                    approved-by: (some tx-sender)
+                })
+            )
+            (ok new-deadline)
+        )
+    )
+)
+
+(define-public (reject-extension (gig-id uint) (milestone-id uint))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+            (milestone (unwrap! (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+            (extension-request (unwrap! (map-get? extension-requests { gig-id: gig-id, milestone-id: milestone-id }) ERR-EXTENSION-NOT-FOUND))
+            (is-employer (is-eq (get employer gig) tx-sender))
+            (is-worker (is-eq (get worker gig) tx-sender))
+            (requester (get requested-by extension-request))
+            (can-reject (or 
+                (and is-employer (is-eq requester (get worker gig)))
+                (and is-worker (is-eq requester (get employer gig)))
+            ))
+        )
+        (asserts! can-reject ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status extension-request) "pending") ERR-EXTENSION-ALREADY-APPROVED)
+        
+        (map-set extension-requests
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge extension-request { status: "rejected" })
+        )
+        (ok true)
+    )
 )
 
 (define-public (emergency-withdraw (gig-id uint))
