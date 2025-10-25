@@ -13,6 +13,8 @@
 (define-constant ERR-EXTENSION-EXPIRED (err u112))
 (define-constant ERR-EXTENSION-ALREADY-APPROVED (err u113))
 (define-constant ERR-EXTENSION-ALREADY-EXISTS (err u114))
+(define-constant ERR-MILESTONES-IN-PROGRESS (err u115))
+(define-constant ERR-ALREADY-CANCELLED (err u116))
 
 (define-constant DISPUTE-TIMEOUT-BLOCKS u1008)
 (define-constant EMERGENCY-WITHDRAWAL-BLOCKS u2016)
@@ -455,5 +457,35 @@
             (merge gig { status: "emergency-withdrawn" })
         )
         (ok remaining-amount)
+    )
+)
+
+(define-public (cancel-gig (gig-id uint))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+        )
+        (asserts! (is-eq (get employer gig) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status gig) "active") ERR-ALREADY-CANCELLED)
+        (asserts! (is-eq (get completed-milestones gig) u0) ERR-MILESTONES-IN-PROGRESS)
+        
+        (try! (as-contract (stx-transfer? (get amount gig) tx-sender (get employer gig))))
+        
+        (map-set gigs
+            { gig-id: gig-id }
+            (merge gig { status: "cancelled" })
+        )
+        (ok (get amount gig))
+    )
+)
+
+(define-read-only (get-cancellable-amount (gig-id uint))
+    (match (map-get? gigs { gig-id: gig-id })
+        gig-data
+            (if (and (is-eq (get status gig-data) "active") (is-eq (get completed-milestones gig-data) u0))
+                (ok (get amount gig-data))
+                (ok u0)
+            )
+        ERR-NOT-FOUND
     )
 )
