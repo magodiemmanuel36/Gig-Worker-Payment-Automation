@@ -15,6 +15,8 @@
 (define-constant ERR-EXTENSION-ALREADY-EXISTS (err u114))
 (define-constant ERR-MILESTONES-IN-PROGRESS (err u115))
 (define-constant ERR-ALREADY-CANCELLED (err u116))
+(define-constant ERR-INVALID-BONUS (err u117))
+(define-constant ERR-BONUS-ALREADY-SET (err u118))
 
 (define-constant DISPUTE-TIMEOUT-BLOCKS u1008)
 (define-constant EMERGENCY-WITHDRAWAL-BLOCKS u2016)
@@ -44,7 +46,9 @@
         completed: bool,
         proof: (string-ascii 256),
         deadline: uint,
-        extended-deadline: (optional uint)
+        extended-deadline: (optional uint),
+        bonus-amount: uint,
+        bonus-paid: bool
     }
 )
 
@@ -118,7 +122,7 @@
         (
             (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
             (milestone (default-to 
-                { amount: u0, completed: false, proof: "", deadline: u0, extended-deadline: none }
+                { amount: u0, completed: false, proof: "", deadline: u0, extended-deadline: none, bonus-amount: u0, bonus-paid: false }
                 (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id })
             ))
         )
@@ -131,7 +135,9 @@
                 completed: false,
                 proof: proof,
                 deadline: (+ stacks-block-height deadline-blocks),
-                extended-deadline: none
+                extended-deadline: none,
+                bonus-amount: u0,
+                bonus-paid: false
             }
         )
         (ok true)
@@ -144,15 +150,20 @@
             (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
             (milestone (unwrap! (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
             (updated-gig (merge gig { completed-milestones: (+ (get completed-milestones gig) u1) }))
+            (bonus-amount (get bonus-amount milestone))
+            (effective-deadline (default-to (get deadline milestone) (get extended-deadline milestone)))
+            (is-early (< stacks-block-height effective-deadline))
+            (should-pay-bonus (and (> bonus-amount u0) is-early (not (get bonus-paid milestone))))
+            (total-payment (if should-pay-bonus (+ (get amount milestone) bonus-amount) (get amount milestone)))
         )
         (asserts! (is-eq (get employer gig) tx-sender) ERR-NOT-AUTHORIZED)
         (asserts! (is-eq (get status gig) "active") ERR-ALREADY-COMPLETED)
         
-        (try! (as-contract (stx-transfer? (get amount milestone) tx-sender (get worker gig))))
+        (try! (as-contract (stx-transfer? total-payment tx-sender (get worker gig))))
         
         (map-set milestones
             { gig-id: gig-id, milestone-id: milestone-id }
-            (merge milestone { completed: true })
+            (merge milestone { completed: true, bonus-paid: should-pay-bonus })
         )
         
         (map-set gigs
@@ -486,6 +497,41 @@
                 (ok (get amount gig-data))
                 (ok u0)
             )
+        ERR-NOT-FOUND
+    )
+)
+
+(define-public (set-milestone-bonus (gig-id uint) (milestone-id uint) (bonus-amount uint))
+    (let
+        (
+            (gig (unwrap! (map-get? gigs { gig-id: gig-id }) ERR-NOT-FOUND))
+            (milestone (unwrap! (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+        )
+        (asserts! (is-eq (get employer gig) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status gig) "active") ERR-INVALID-GIG)
+        (asserts! (not (get completed milestone)) ERR-ALREADY-COMPLETED)
+        (asserts! (is-eq (get bonus-amount milestone) u0) ERR-BONUS-ALREADY-SET)
+        (asserts! (> bonus-amount u0) ERR-INVALID-BONUS)
+        
+        (try! (stx-transfer? bonus-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set milestones
+            { gig-id: gig-id, milestone-id: milestone-id }
+            (merge milestone { bonus-amount: bonus-amount })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone-bonus-status (gig-id uint) (milestone-id uint))
+    (match (map-get? milestones { gig-id: gig-id, milestone-id: milestone-id })
+        milestone-data
+            (ok {
+                bonus-amount: (get bonus-amount milestone-data),
+                bonus-paid: (get bonus-paid milestone-data),
+                is-early: (< stacks-block-height (default-to (get deadline milestone-data) (get extended-deadline milestone-data))),
+                completed: (get completed milestone-data)
+            })
         ERR-NOT-FOUND
     )
 )
